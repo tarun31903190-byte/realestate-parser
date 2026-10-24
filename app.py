@@ -1,6 +1,8 @@
+import io
 import json
 import re
 import time
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -107,10 +109,32 @@ if not API_KEY:
     st.error("GEMINI_API_KEY Streamlit secrets mein set nahi hai. README dekho.")
     st.stop()
 
-uploaded = st.file_uploader("WhatsApp chat export (.txt) upload karein", type=["txt"])
+def read_uploads(files):
+    """txt ya zip (andar ki .txt) files padh kar ek text bana deta hai. Media ignore hota hai."""
+    parts = []
+    for f in files:
+        data = f.read()
+        if f.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    for name in z.namelist():
+                        if name.lower().endswith(".txt"):
+                            parts.append(z.read(name).decode("utf-8", errors="ignore"))
+            except zipfile.BadZipFile:
+                st.warning(f"{f.name} valid zip nahi hai.")
+        else:
+            parts.append(data.decode("utf-8", errors="ignore"))
+    return "\n".join(parts)
+
+
+uploaded = st.file_uploader(
+    "WhatsApp chat export (.txt ya .zip) upload karein",
+    type=["txt", "zip"],
+    accept_multiple_files=True,
+)
 
 if uploaded:
-    raw = uploaded.read().decode("utf-8", errors="ignore")
+    raw = read_uploads(uploaded)
     msgs = parse_chat(raw)
     for i, m in enumerate(msgs):
         m["id"] = i
