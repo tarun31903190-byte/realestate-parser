@@ -1,178 +1,121 @@
-import io
-import json
-import re
-import time
-import zipfile
+import os
+import tempfile
 
 import pandas as pd
 import streamlit as st
 from google import genai
-from google.genai import types
 
-# ---------- Config ----------
-# Model name Google time-time par badalta rehta hai. Agar error aaye to
-# AI Studio mein dekho kaun sa Flash model available hai aur Streamlit secrets mein MODEL set karo.
-MODEL = st.secrets.get("MODEL", "gemini-2.5-flash")
+import core
+import db
+
+MODEL = st.secrets.get("MODEL", "gemini-3.8-flash")
 API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-BATCH_SIZE = 40          # ek request mein kitne messages bhejne hain
-SLEEP_BETWEEN = 4        # free tier rate limit ke liye (seconds)
+DB_PATH = os.path.join(tempfile.gettempdir(), "realestate.db")
 
-st.set_page_config(page_title="Real Estate WhatsApp Parser", layout="wide")
-st.title("🏠 Real Estate WhatsApp Chat Parser")
+st.set_page_config(page_title="Real Estate AI", page_icon="🏠", layout="wide")
+st.title("🏠 Real Estate AI Database")
 
-# ---------- WhatsApp parsing ----------
-LINE_RE = re.compile(
-    r"^\[?(\d{1,2}/\d{1,2}/\d{2,4}),?\s+"
-    r"(\d{1,2}:\d{2}(?::\d{2})?(?:\s?[APap][Mm])?)\]?\s*-?\s*"
-    r"([^:]+?):\s(.*)$"
-)
-
-KEYWORDS = re.compile(
-    r"(bhk|rk|flat|villa|plot|house|shop|office|rent|sale|sell|lakh|lac|cr\b|crore|"
-    r"sq\.?\s?ft|sqft|sq\s?yd|gaj|kiraya|bikau|available|requirement|required|"
-    r"\d{10})",
-    re.IGNORECASE,
-)
-
-
-def parse_chat(text: str):
-    text = text.replace("\u202f", " ").replace("\u200e", "")
-    messages = []
-    for line in text.splitlines():
-        m = LINE_RE.match(line)
-        if m:
-            date, time_, sender, body = m.groups()
-            messages.append({"date": date, "time": time_, "sender": sender.strip(), "text": body})
-        elif messages:  # multi-line message ka continuation
-            messages[-1]["text"] += "\n" + line
-    return messages
-
-
-def is_candidate(msg):
-    t = msg["text"]
-    if "<Media omitted>" in t or "deleted" in t.lower() and len(t) < 40:
-        return False
-    return len(t) > 25 and bool(KEYWORDS.search(t))
-
-
-# ---------- Gemini extraction ----------
-PROMPT = """You extract real estate data from WhatsApp group messages (Hindi/English/Hinglish).
-Each message below has an id. Return ONLY a JSON array. For each message that is a
-property listing or a requirement, output one object (one object per property if a message lists several):
-
-{{
-  "msg_id": int,
-  "listing_type": "Sale" | "Rent" | "Requirement" | "Unknown",
-  "property_type": "Flat" | "Villa" | "House" | "Plot" | "Shop" | "Office" | "Land" | "Other",
-  "bhk": string or null,
-  "area": string or null,
-  "price": string or null,
-  "location": string or null,
-  "contact_number": string or null,
-  "notes": string or null
-}}
-
-Rules:
-- Skip greetings, forwards, jokes, ads that are not property related.
-- Never invent values. If something is not stated, use null.
-- Keep price exactly as written (e.g. "45 lakh", "1.2 Cr", "15k/month").
-- contact_number: digits only if present in the message.
-
-Messages:
-{messages}
-"""
-
-
-def extract_batch(client, batch):
-    payload = "\n\n".join(f"[id={m['id']}] sender={m['sender']}\n{m['text']}" for m in batch)
-    for attempt in range(3):
-        try:
-            resp = client.models.generate_content(
-                model=MODEL,
-                contents=PROMPT.format(messages=payload),
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json", temperature=0
-                ),
-            )
-            data = json.loads(resp.text)
-            return data if isinstance(data, list) else []
-        except Exception as e:  # rate limit / bad JSON
-            if attempt == 2:
-                st.warning(f"Ek batch fail hua: {e}")
-                return []
-            time.sleep(10 * (attempt + 1))
-    return []
-
-
-# ---------- UI ----------
 if not API_KEY:
-    st.error("GEMINI_API_KEY Streamlit secrets mein set nahi hai. README dekho.")
+    st.error("GEMINI_API_KEY Streamlit secrets mein set nahi hai.")
     st.stop()
 
-def read_uploads(files):
-    """txt ya zip (andar ki .txt) files padh kar ek text bana deta hai. Media ignore hota hai."""
-    parts = []
-    for f in files:
-        data = f.read()
-        if f.name.lower().endswith(".zip"):
-            try:
-                with zipfile.ZipFile(io.BytesIO(data)) as z:
-                    for name in z.namelist():
-                        if name.lower().endswith(".txt"):
-                            parts.append(z.read(name).decode("utf-8", errors="ignore"))
-            except zipfile.BadZipFile:
-                st.warning(f"{f.name} valid zip nahi hai.")
-        else:
-            parts.append(data.decode("utf-8", errors="ignore"))
-    return "\n".join(parts)
+client = genai.Client(api_key=API_KEY)
+con = db.connect(DB_PATH)
 
+# ---------------- Sidebar: database backup / restore ----------------
+with st.sidebar:
+    s = db.stats(con)
+    st.subheader("📦 Database")
+    st.metric("Listings", f"{s['listings']:,}")
+    st.caption(f"{s['locations']:,} locations · {s['messages_done']:,} entries processed · "
+               f"size {os.path.getsize(DB_PATH) / 1e6:.2f} MB")
+    st.warning("Streamlit free server restart hone par database mit jata hai. "
+               "Har baar kaam ke baad **Backup download** karo, aur restart ke baad **Restore** karo.")
+    if s["listings"]:
+        con.commit()
+        con.execute("VACUUM")
+        with open(DB_PATH, "rb") as f:
+            st.download_button("⬇️ Backup download (.db)", f.read(), "realestate.db",
+                               "application/octet-stream", use_container_width=True)
+    restore = st.file_uploader("⬆️ Backup restore karo (.db)", type=["db"], key="restore")
+    if restore is not None and st.button("Restore karo", use_container_width=True):
+        con.close()
+        with open(DB_PATH, "wb") as f:
+            f.write(restore.read())
+        st.success("Restore ho gaya. Page refresh karo.")
+        st.stop()
 
-uploaded = st.file_uploader(
-    "WhatsApp chat export (.txt ya .zip) upload karein",
-    type=["txt", "zip"],
-    accept_multiple_files=True,
-)
+tab_chat, tab_add = st.tabs(["💬 Sawal pucho", "➕ Chat add karo"])
 
-if uploaded:
-    raw = read_uploads(uploaded)
-    msgs = parse_chat(raw)
-    for i, m in enumerate(msgs):
-        m["id"] = i
-    candidates = [m for m in msgs if is_candidate(m)]
+# ---------------- Tab 1: Q&A ----------------
+with tab_chat:
+    st.caption("Kisi bhi bhasha mein pucho. Jaise: *Nariman City mein 1 BHK flat batao* · "
+               "*50 lakh tak ka plot RR Residency* · *Indore mein rent par 2 BHK*")
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    for role, content in st.session_state.history:
+        with st.chat_message(role):
+            if isinstance(content, pd.DataFrame):
+                st.dataframe(content, use_container_width=True, hide_index=True)
+            else:
+                st.markdown(content)
 
-    c1, c2 = st.columns(2)
-    c1.metric("Total messages", len(msgs))
-    c2.metric("Property-jaise messages", len(candidates))
+    q = st.chat_input("Apna sawal likho...")
+    if q:
+        st.session_state.history.append(("user", q))
+        with st.chat_message("user"):
+            st.markdown(q)
+        with st.chat_message("assistant"):
+            if db.stats(con)["listings"] == 0:
+                msg = "Database abhi khaali hai. Pehle **Chat add karo** tab mein chat upload karo."
+                st.markdown(msg); st.session_state.history.append(("assistant", msg))
+            else:
+                try:
+                    flt = core.parse_question(client, MODEL, q)
+                    rows, loc_ok = db.search(con, flt, limit=25)
+                except Exception as e:
+                    flt, rows, loc_ok = {}, [], True
+                    st.error(f"Sawal samajhne mein dikkat: {str(e)[:150]}")
+                if not loc_ok:
+                    msg = f"**{flt.get('location')}** naam ki koi location database mein nahi mili."
+                    st.markdown(msg); st.session_state.history.append(("assistant", msg))
+                elif not rows:
+                    msg = "Is filter se koi listing nahi mili. Price ya BHK thoda badal ke try karo."
+                    st.markdown(msg); st.session_state.history.append(("assistant", msg))
+                else:
+                    shown = {k: v for k, v in flt.items() if v}
+                    msg = f"**{len(rows)} listings mili** (naye pehle). Filter: `{shown}`"
+                    st.markdown(msg)
+                    df = pd.DataFrame(rows)
+                    df = df.loc[:, (df != "").any(axis=0)]
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.session_state.history.append(("assistant", msg))
+                    st.session_state.history.append(("assistant", df))
 
-    if st.button("Extract Real Estate Data", type="primary") and candidates:
-        client = genai.Client(api_key=API_KEY)
-        by_id = {m["id"]: m for m in msgs}
-        rows = []
-        bar = st.progress(0.0)
-        n_batches = (len(candidates) + BATCH_SIZE - 1) // BATCH_SIZE
-
-        for b in range(n_batches):
-            batch = candidates[b * BATCH_SIZE:(b + 1) * BATCH_SIZE]
-            for item in extract_batch(client, batch):
-                src = by_id.get(item.get("msg_id"))
-                if src:
-                    item["date"] = src["date"]
-                    item["posted_by"] = src["sender"]
-                rows.append(item)
-            bar.progress((b + 1) / n_batches)
-            time.sleep(SLEEP_BETWEEN)
-
-        if not rows:
-            st.warning("Koi listing nahi mili.")
-        else:
-            df = pd.DataFrame(rows).drop(columns=["msg_id"], errors="ignore")
-            df = df.drop_duplicates(subset=["contact_number", "price", "location", "bhk"])
-            st.success(f"{len(df)} listings mili")
-            st.dataframe(df, use_container_width=True)
-            st.download_button(
-                "CSV download karein",
-                df.to_csv(index=False).encode("utf-8-sig"),
-                "listings.csv",
-                "text/csv",
-            )
-            st.caption("Accuracy ~90-95% hoti hai. Important listings ek baar manually verify kar lein.")
+# ---------------- Tab 2: Add chats ----------------
+with tab_add:
+    uploaded = st.file_uploader("WhatsApp chat (.txt ya .zip, kai files ek saath bhi)",
+                                type=["txt", "zip"], accept_multiple_files=True)
+    c1, c2, c3 = st.columns(3)
+    max_batches = c1.number_input("Ek baar mein max batches (1 batch = 40 messages)", 1, 500, 40,
+                                  help="Free Gemini ki daily limit ke hisaab se. Baaki kaam agle din resume hota hai.")
+    keep_source = c2.checkbox("Original message bhi save karo (size badhta hai)", value=False)
+    if uploaded:
+        msgs = core.parse_chat(core.read_uploads(uploaded))
+        cands = [m for m in msgs if core.is_candidate(m)]
+        st.write(f"Total messages: **{len(msgs):,}** · Property-jaise: **{len(cands):,}**")
+        if st.button("🚀 Database mein daalo", type="primary"):
+            bar = st.progress(0.0)
+            errs = []
+            res = core.ingest(
+                con, client, MODEL, msgs, db, max_batches=int(max_batches), keep_source=keep_source,
+                progress=lambda d, t: bar.progress(d / max(t, 1)), log=errs.append)
+            con.commit()
+            st.success(f"{res['new_listings']} nayi listings save hui "
+                       f"({res['new_messages']} naye messages padhe).")
+            if res["pending_messages"]:
+                st.info(f"{res['pending_messages']:,} messages abhi baaki hain. "
+                        "Wahi file dobara upload karke button dabao, ye wahin se aage badhega.")
+            if res["failed_batches"]:
+                st.warning(f"{res['failed_batches']} batch fail hue (limit/error). Dobara chalao, "
+                           f"wo dobara try honge. Error: {errs[-1] if errs else ''}")
